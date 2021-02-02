@@ -36,7 +36,7 @@ class DiscordServer {
     this.discordBot = discordBot
     this.bot = this.discordBot.bot
 
-    this.server = this.bot.guilds.get(id)
+    this.server = this.bot.guilds.resolve(id)
 
     this.verifyCooldowns = new Map()
     this.nicknames = new Map()
@@ -202,7 +202,7 @@ class DiscordServer {
     let groups = await Cache.get(`bindings.${userid}`, '__groups')
     if (!groups) {
       groups = await request({
-        uri: `http://api.roblox.com/users/${userid}/groups`,
+        uri: `https://groups.roblox.com/v2/users/${userid}/groups/roles`,
         json: true
       })
 
@@ -213,7 +213,7 @@ class DiscordServer {
       Cache.set(`bindings.${userid}`, '__groups', groups)
     }
 
-    return groups
+    return groups.data
   }
 
   /**
@@ -253,8 +253,8 @@ class DiscordServer {
 
         let rank = 0
         for (const groupObj of groups) {
-          if (groupObj.Id.toString() === group.id) {
-            rank = groupObj.Rank
+          if (groupObj.group.id.toString() === group.id) {
+            rank = groupObj.role.rank
             break
           }
         }
@@ -341,7 +341,7 @@ class DiscordServer {
     }
 
     if (this.getSetting('announceChannel')) {
-      const channel = await this.server.channels.get(this.getSetting('announceChannel'))
+      const channel = await this.server.channels.cache.get(this.getSetting('announceChannel'))
 
       if (channel) {
         try {
@@ -418,6 +418,16 @@ class DiscordServer {
     }
 
     return false
+  }
+
+  canManageRole (roleResolvable) {
+    if (!this.server.me.hasPermission('MANAGE_ROLES')) return false
+
+    const role = this.server.roles.cache.get(roleResolvable)
+
+    if (!role) return false
+
+    return this.server.me.roles.highest.comparePositionTo(role) > 0
   }
 }
 
