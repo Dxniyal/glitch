@@ -21,6 +21,7 @@ class DiscordBot {
     this.servers = {}
     this.authorizedOwners = []
     this.patronTransfers = {}
+    this.blacklist = {}
   }
 
   /**
@@ -34,7 +35,12 @@ class DiscordBot {
       owner: config.owner || '0',
       commandPrefix: config.commandPrefix || '!',
       unknownCommandResponse: false,
-      disableEveryone: true
+      disableMentions: 'everyone',
+      messageCacheMaxSize: 0,
+      retryLimit: 0,
+      ws: {
+        intents: ["GUILD_MEMBERS", "GUILDS", "GUILD_MESSAGES"],
+      },
     })
 
     this.bot.setProvider(new SettingProvider())
@@ -55,19 +61,53 @@ class DiscordBot {
 
     // We use .bind(this) so that the context remains within
     // the class and not the event.
+    // this.bot.on('debug', (info) => { console.log(`[DEBUG SHARD${this.bot.shard.ids[0]}] ${info}`)})
+    this.bot.on('warn', (info) => { console.log(`[WARN SHARD${this.bot.shard.ids[0]}] ${info}`)})
+    this.bot.on('rateLimit', (err) => { console.error(`[RL SHARD${this.bot.shard.ids[0]}] ${JSON.stringify(err)}`)})
+    this.bot.on('error', (err) => { console.error(`[ERR SHARD${this.bot.shard.ids[0]}] `, err)})
+    this.bot.on('shardError', (err, id) => { console.error(`[WS SHARD${id}] ${JSON.stringify(err)}`)})
+    this.bot.on('shardDisconnect', (event, id) => { console.error(`[WS SHARD${id}] ${JSON.stringify(event)}`)})
+    process.on('unhandledRejection', (reason, promise) => {
+      console.log('Unhandled Rejection at:', promise, 'reason:', reason);
+    });
     this.bot.on('ready', this.ready.bind(this))
     this.bot.on('guildMemberAdd', this.guildMemberAdd.bind(this))
-    if (config.loud) this.bot.on('error', (message) => console.log(message))
 
-    // Only hook up if lockNicknames mode is enabled.
-    if (config.lockNicknames) {
-      this.bot.on('message', this.message.bind(this))
+    this.bot.on('message', this.message.bind(this))
+
+    this.bot.on('invalidated', () => { // This should never happen!
+      console.error(`Sesson on shard ${this.bot.shard.ids[0]} invalidated - exiting!`)
+      process.exit(0)
+    })
+
+    if (config.loud) {
+      this.bot.on('error', (message) => console.log(message))
+      process.on('unhandledRejection', (reason, promise) => {
+        console.log('Unhandled rejection at:', promise, 'reason:', reason)
+      })
     }
+
+    this.bot.dispatcher.addInhibitor(msg => {
+      if (!msg.guild) {
+        return
+      }
+
+      if (this.blacklist[msg.guild.ownerID]) {
+        msg.reply("This server is blacklisted!")
+        return 'blacklisted'
+      }
+    })
 
     if (this.isPremium()) {
       this.bot.dispatcher.addInhibitor(msg => {
         if (msg.guild && !this.authorizedOwners.includes(msg.guild.ownerID)) {
-          return msg.reply(`Sorry, this server isn't authorized to use RoVer Plus.${msg.member.hasPermission(['MANAGE_GUILD']) ? ' The server owner needs to donate at <https://www.patreon.com/erynlynn>, or you can invite the regular RoVer bot at <https://RoVer.link>.' : ''}`) // notify sender to donate only if they're an "admin"
+          if (this.authorizedOwners.length === 0) {
+            msg.reply('Sorry, the authorized users list is still being downloaded. This occurs when the bot has recently restarted. Please wait a few seconds and try again.')
+          } else {
+            msg.reply(`Sorry, this server isn't authorized to use RoVer Plus.${msg.member.hasPermission(['MANAGE_GUILD']) ? ' The server owner needs to donate at <https://www.patreon.com/erynlynn>, or you can invite the regular RoVer bot at <https://RoVer.link>.' : ''} If you are a patron encountering this issue, try running '${this.bot.commandPrefix}transferplus ${msg.guild.ownerID}'`) // notify sender to donate only if they're an "admin"
+          }
+
+          return 'not_premium'
         }
       })
 
@@ -99,15 +139,51 @@ class DiscordBot {
 
     // Login.
     this.bot.login(process.env.CLIENT_TOKEN)
+
+    this.updateBlacklist().catch(console.error)
   }
 
   isPremium () {
     return !!config.patreonAccessToken
   }
 
-  async updatePatrons (page) {
+  async updateBlacklist () {
+    if (!config.banServer) {
+      return false
+    }
+
+    const response = await request(`https://discord.com/api/v6/guilds/${config.banServer}/bans`, {
+      json: true,
+      headers: {
+        Authorization: `Bot ${config.token}`
+      }
+    })
+
+    response.forEach(ban => {
+      this.blacklist[ban.user.id] = true
+    })
+  }
+
+  async updateBlacklist () {
+    if (!config.banServer) {
+      return false
+    }
+
+    const response = await request(`https://discord.com/api/v6/guilds/${config.banServer}/bans`, {
+      json: true,
+      headers: {
+        Authorization: `Bot ${config.token}`
+      }
+    })
+
+    response.forEach(ban => {
+      this.blacklist[ban.user.id] = true
+    })
+  }
+
+  async updatePatrons (page, newAuthorizedOwners) {
     if (!page) {
-      this.authorizedOwners = []
+      newAuthorizedOwners = []
     }
 
     const transferFilePath = path.join(__dirname, './data/transfers.csv')
@@ -134,10 +210,10 @@ class DiscordBot {
       }
     })
 
-    this.authorizedOwners = [
+    newAuthorizedOwners = [
       config.owner || '0',
       ...(config.patreonOverrideOwners || []),
-      ...this.authorizedOwners,
+      ...newAuthorizedOwners,
       ...(
         response.data.filter(pledge => (
           pledge.attributes.declined_since === null
@@ -153,7 +229,9 @@ class DiscordBot {
     ].map(id => this.patronTransfers[id] || id)
 
     if (response.links && response.links.next) {
-      return this.updatePatrons(response.links.next)
+      return this.updatePatrons(response.links.next, newAuthorizedOwners)
+    } else {
+      this.authorizedOwners = newAuthorizedOwners
     }
   }
 
@@ -163,10 +241,10 @@ class DiscordBot {
    * @memberof DiscordBot
    */
   ready () {
-    console.log(`Shard ${this.bot.shard.ids[0]} is ready, serving ${this.bot.guilds.array().length} guilds.`)
+    console.log(`Shard ${this.bot.shard.ids[0]} is ready, serving ${this.bot.guilds.cache.array().length} guilds.`)
 
     // Set status message to the default until we get info from master process
-    this.setActivity()
+    this.bot.user.setActivity('rover.link', { type: "LISTENING" })
   }
 
   /**
@@ -192,12 +270,14 @@ class DiscordBot {
     if (!member) return
 
     // If this is the verify channel, we want to delete the message and just verify the user if they aren't an admin.
-    if (server.getSetting('verifyChannel') === message.channel.id && message.cleanContent.toLowerCase() !== message.guild.commandPrefix + 'verify' && !(this.bot.isOwner(message.author) || message.member.hasPermission('MANAGE_GUILD') || message.member.roles.find(role => role.name === 'RoVer Admin'))) {
-      message.delete()
+    if (server.getSetting('verifyChannel') === message.channel.id && message.cleanContent.toLowerCase() !== message.guild.commandPrefix + 'verify' && !(this.bot.isOwner(message.author) || message.member.hasPermission('MANAGE_GUILD') || message.member.roles.cache.find(role => role.name === 'RoVer Admin'))) {
+      if (message.channel.permissionsFor(message.guild.me).has('MANAGE_MESSAGES')) {
+        message.delete().catch(console.error)
+      }
       return member.verify({ message })
     }
 
-    if (!config.disableAutoUpdate && member.shouldUpdateNickname(message.member.displayName)) {
+    if (!config.disableAutoUpdate && member.shouldUpdateNickname(message.member.displayName) && config.lockNicknames) {
       // As a last resort, we just verify with cache on every message sent.
       await member.verify({
         announce: false,
@@ -223,6 +303,20 @@ class DiscordBot {
 
     const discordMember = await server.getMember(member.id)
     if (!member) return
+
+    // Check the guild's verification level
+    const securityLevel = member.guild.verificationLevel
+    const securityMessageIntro = `Welcome to ${member.guild.name}! This Discord server uses a Roblox account verification system to keep our community safe. Due to this server's security settings,`
+    if (securityLevel === 'MEDIUM' && (member.joinedTimestamp - member.user.createdTimestamp < 300000)) {
+      member.send(`${securityMessageIntro} you must wait until your account is at least 5 minutes old to verify. Once the time is up, run \`${member.guild.commandPrefix}verify\` in the server to verify.`).catch(() => {})
+      return
+    } else if (securityLevel === 'HIGH') {
+      member.send(`${securityMessageIntro} you must wait 10 minutes to verify if you do not have a phone number linked to your Discord account. If you do have a linked phone number, you may immediately run \`${member.guild.commandPrefix}verify\` in the server.`).catch(() => {})
+      return
+    } else if (securityLevel === 'VERY_HIGH') {
+      member.send(`${securityMessageIntro} you must link your phone number to your Discord account. If you have already done so, you may run \`${member.guild.commandPrefix}verify\` in the server.`).catch(() => {})
+      return
+    }
     const action = await discordMember.verify()
 
     try {
@@ -243,6 +337,8 @@ class DiscordBot {
    * @memberof DiscordBot
    */
   setActivity (text, activityType) {
+    if (!this.bot || !this.bot.user) return
+
     this.bot.user.setActivity(text || 'http://eryn.io/RoVer', { type: activityType })
   }
 
@@ -281,9 +377,9 @@ class DiscordBot {
     // Iterate through all of the guilds the bot is in.
     for (const guildId of guilds) {
       try {
-        if (!this.bot.guilds.has(guildId)) continue
+        if (!this.bot.guilds.cache.has(guildId)) continue
 
-        const guild = this.bot.guilds.get(guildId)
+        const guild = this.bot.guilds.resolve(guildId)
         const server = await this.getServer(guild.id)
 
         const member = await server.getMember(id)
@@ -301,7 +397,7 @@ class DiscordBot {
           // It worked, checking if there's a custom welcome message.
           await this.bot.users.fetch(id)
 
-          const guildMember = await this.bot.guilds.get(guild.id).members.fetch(id)
+          const guildMember = await this.bot.guilds.resolve(guild.id).members.fetch(id)
           guildMember.send(server.getWelcomeMessage(action, guildMember)).catch(() => {})
         }
 
